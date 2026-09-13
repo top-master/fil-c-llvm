@@ -1,0 +1,5 @@
+# Remove the weak-def bit from these external symbols
+_pizlonated__ZT*
+_pizlonated__ZN*
+_pizlonated__ZS*
+
