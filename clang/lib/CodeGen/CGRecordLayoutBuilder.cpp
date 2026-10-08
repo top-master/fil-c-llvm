@@ -24,6 +24,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/TypedPointerType.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -222,6 +223,7 @@ struct CGRecordLowering {
   llvm::DenseMap<const CXXRecordDecl *, unsigned> VirtualBases;
   bool IsZeroInitializable : 1;
   bool IsZeroInitializableAsBase : 1;
+  bool IsFilPtrUnion : 1;
   bool Packed : 1;
 private:
   CGRecordLowering(const CGRecordLowering &) = delete;
@@ -235,7 +237,7 @@ CGRecordLowering::CGRecordLowering(CodeGenTypes &Types, const RecordDecl *D,
       RD(dyn_cast<CXXRecordDecl>(D)),
       Layout(Types.getContext().getASTRecordLayout(D)),
       DataLayout(Types.getDataLayout()), IsZeroInitializable(true),
-      IsZeroInitializableAsBase(true), Packed(Packed) {}
+      IsZeroInitializableAsBase(true), IsFilPtrUnion(false), Packed(Packed) {}
 
 void CGRecordLowering::setBitFieldInfo(
     const FieldDecl *FD, CharUnits StartOffset, llvm::Type *StorageType) {
@@ -310,11 +312,51 @@ void CGRecordLowering::lower(bool NVBaseType) {
   computeVolatileBitfields();
 }
 
+static bool hasPointers(llvm::Type* T) {
+  if (isa<llvm::FunctionType>(T)) {
+    llvm_unreachable("shouldn't see function types in hasPointers");
+    return false;
+  }
+
+  if (isa<llvm::TypedPointerType>(T)) {
+    llvm_unreachable("Shouldn't ever see typed pointers");
+    return false;
+  }
+
+  if (isa<llvm::PointerType>(T)) {
+    assert (!T->getPointerAddressSpace());
+    return true;
+  }
+
+  if (llvm::StructType* ST = dyn_cast<llvm::StructType>(T)) {
+    for (unsigned Index = ST->getNumElements(); Index--;) {
+      llvm::Type* InnerT = ST->getElementType(Index);
+      if (hasPointers(InnerT))
+        return true;
+    }
+    return false;
+  }
+      
+  if (llvm::ArrayType* AT = dyn_cast<llvm::ArrayType>(T))
+    return hasPointers(AT->getElementType());
+
+  if (llvm::FixedVectorType* VT = dyn_cast<llvm::FixedVectorType>(T))
+    return hasPointers(VT->getElementType());
+
+  if (isa<llvm::ScalableVectorType>(T)) {
+    llvm_unreachable("Shouldn't ever see scalable vectors in hasPtrs");
+    return false;
+  }
+    
+  return false;
+}
+
 void CGRecordLowering::lowerUnion(bool isNonVirtualBaseType) {
   CharUnits LayoutSize =
       isNonVirtualBaseType ? Layout.getDataSize() : Layout.getSize();
   llvm::Type *StorageType = nullptr;
   bool SeenNamedMember = false;
+  bool HasPointers = false;
   // Iterate through the fields setting bitFieldInfo and the Fields array. Also
   // locate the "most appropriate" storage type.  The heuristic for finding the
   // storage type isn't necessary, the first (non-0-length-bitfield) field's
@@ -331,6 +373,7 @@ void CGRecordLowering::lowerUnion(bool isNonVirtualBaseType) {
     }
     Fields[Field->getCanonicalDecl()] = 0;
     llvm::Type *FieldType = getStorageType(Field);
+    HasPointers |= hasPointers(FieldType);
     // Compute zero-initializable status.
     // This union might not be zero initialized: it may contain a pointer to
     // data member which might have some exotic initialization sequence.
@@ -358,6 +401,29 @@ void CGRecordLowering::lowerUnion(bool isNonVirtualBaseType) {
          getSize(FieldType) > getSize(StorageType)) ||
         (!StorageType->isPointerTy() && FieldType->isPointerTy()))
       StorageType = FieldType;
+  }
+  // If we are zero-initializable and have pointers, create a type consisting of pointers.
+  if (HasPointers) {
+    std::vector<llvm::Type*> Ts;
+    CharUnits RemainingSize = LayoutSize;
+    while (RemainingSize >= CharUnits::fromQuantity(8)) {
+      Ts.push_back(llvm::PointerType::get(Types.getLLVMContext(), 0));
+      RemainingSize -= CharUnits::fromQuantity(8);
+    }
+    if (!RemainingSize.isZero())
+      Ts.push_back(getByteArrayType(RemainingSize));
+    llvm::Type* NewStorageType = llvm::StructType::get(Types.getLLVMContext(), Ts, /*Packed=*/true);
+    if (LayoutSize != getSize(NewStorageType)) {
+      llvm::errs() << "Lowering union " << *D << "\n";
+      llvm::errs() << "LayoutSize = " << LayoutSize.getQuantity() << "\n";
+      llvm::errs() << "StorageType size = " << getSize(StorageType).getQuantity() << "\n";
+      llvm::errs() << "StorageType = " << *StorageType << "\n";
+      llvm::errs() << "NewStorageType size = " << getSize(NewStorageType).getQuantity() << "\n";
+      llvm::errs() << "NewStorageType = " << *NewStorageType << "\n";
+    }
+    assert(LayoutSize == getSize(NewStorageType));
+    StorageType = NewStorageType;
+    IsFilPtrUnion = true;
   }
   // If we have no storage type just pad to the appropriate size and return.
   if (!StorageType)
@@ -1104,6 +1170,8 @@ CodeGenTypes::ComputeRecordLayout(const RecordDecl *D, llvm::StructType *Ty) {
       // on both of them with the same index.
       assert(Builder.Packed == BaseBuilder.Packed &&
              "Non-virtual and complete types must agree on packedness");
+      assert(Builder.IsFilPtrUnion == BaseBuilder.IsFilPtrUnion &&
+             "Non-virtual and complete types must agree on pizlness");
     }
   }
 
@@ -1114,7 +1182,8 @@ CodeGenTypes::ComputeRecordLayout(const RecordDecl *D, llvm::StructType *Ty) {
 
   auto RL = std::make_unique<CGRecordLayout>(
       Ty, BaseTy, (bool)Builder.IsZeroInitializable,
-      (bool)Builder.IsZeroInitializableAsBase);
+      (bool)Builder.IsZeroInitializableAsBase,
+      (bool)Builder.IsFilPtrUnion);
 
   RL->NonVirtualBases.swap(Builder.NonVirtualBases);
   RL->CompleteObjectVirtualBases.swap(Builder.VirtualBases);
@@ -1221,6 +1290,7 @@ void CGRecordLayout::print(raw_ostream &OS) const {
   if (BaseSubobjectType)
     OS << "  NonVirtualBaseLLVMType:" << *BaseSubobjectType << "\n";
   OS << "  IsZeroInitializable:" << IsZeroInitializable << "\n";
+  OS << "  IsFilPtrUnion:" << IsFilPtrUnion << "\n";
   OS << "  BitFields:[\n";
 
   // Print bit-field infos in declaration order.

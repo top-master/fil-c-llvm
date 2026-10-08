@@ -7814,6 +7814,14 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     }
   }
 
+  if (Args.hasArg(options::OPT_yolo_assembler)) {
+    // Tell the FilPizlonator pass to recognize the zunsafe_call, zunsafe_fast_call, and
+    // zunsafe_buf_call intrinsics. This mirrors ToolChain::SelectTool, where
+    // -yolo-assembler opts out of the sarcasm assembler for .s files.
+    CmdArgs.push_back("-mllvm");
+    CmdArgs.push_back("-yolo-assembler");
+  }
+
   // This needs to run after -Xclang argument forwarding to pick up the target
   // features enabled through -Xclang -target-feature flags.
   SanitizeArgs.addArgs(TC, Args, CmdArgs, InputType);

@@ -158,16 +158,21 @@ private:
   /// considered as a base subobject, requires a non-zero bitpattern
   /// when zero-initialized.
   bool IsZeroInitializableAsBase : 1;
+  
+  /// True if we did the Fil-C union hack for pointers.
+  bool IsFilPtrUnion : 1;
 
 public:
   CGRecordLayout(llvm::StructType *CompleteObjectType,
                  llvm::StructType *BaseSubobjectType,
                  bool IsZeroInitializable,
-                 bool IsZeroInitializableAsBase)
+                 bool IsZeroInitializableAsBase,
+                 bool IsFilPtrUnion)
     : CompleteObjectType(CompleteObjectType),
       BaseSubobjectType(BaseSubobjectType),
       IsZeroInitializable(IsZeroInitializable),
-      IsZeroInitializableAsBase(IsZeroInitializableAsBase) {}
+      IsZeroInitializableAsBase(IsZeroInitializableAsBase),
+      IsFilPtrUnion(IsFilPtrUnion) {}
 
   /// Return the "complete object" LLVM type associated with
   /// this record.
@@ -191,6 +196,11 @@ public:
   /// with a zeroinitializer when considered as a base subobject.
   bool isZeroInitializableAsBase() const {
     return IsZeroInitializableAsBase;
+  }
+
+  // Check if this type is a hacked union in Fil-C.
+  bool isFilPtrUnion() const {
+    return IsFilPtrUnion;
   }
 
   bool containsFieldDecl(const FieldDecl *FD) const {
