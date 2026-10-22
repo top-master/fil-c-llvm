@@ -1,7 +1,7 @@
 # fil-c-llvm
 
 The LLVM and Clang sources (with libc++) of [Fil-C](https://github.com/pizlonator/fil-c),
-used by [Fil-C-Light](https://github.com/top-master/fil-c-light) as its `compiler/`
+used by [Fil-C-Light](https://github.com/top-master/fil-c-light) as its `3rd-party/fil-c-llvm`
 submodule, and the releases of Fil-C-Light's prebuilt toolchain packages.
 
 ## Usage
